@@ -36,7 +36,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: Silthus/posthog-workflows-action@028eaa17c6cd3dbb46f2a9d80b956571a0573976 # v0.1.1
+      - uses: Silthus/posthog-workflows-action@0cab58e324130751b02374d2c76b3fc614438671 # v0.1.2
         with:
           api-key: ${{ secrets.POSTHOG_API_KEY }}
           project-id: ${{ vars.POSTHOG_PROJECT_ID }}
@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: Silthus/posthog-workflows-action@028eaa17c6cd3dbb46f2a9d80b956571a0573976 # v0.1.1
+      - uses: Silthus/posthog-workflows-action@0cab58e324130751b02374d2c76b3fc614438671 # v0.1.2
         with:
           api-key: ${{ secrets.POSTHOG_API_KEY }}
           project-id: ${{ vars.POSTHOG_PROJECT_ID }}
