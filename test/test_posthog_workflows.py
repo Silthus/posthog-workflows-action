@@ -88,6 +88,8 @@ INJECTED_FILE_NAME = f"evil{INJECTION}.yaml"
 LONG_DETAIL = f"Too long{INJECTION}" + "x" * 200_000
 MANY_PERCENT_SIGNS = "%" * 200_000
 
+DROP_CONNECTION = 0
+
 RUNNER_LINE_BREAK = re.compile(r"\r\n|\r|\n")
 RUNNER_COMMANDS = {
     "stop-commands", "internal-set-repo-path", "set-env", "set-output", "save-state", "add-mask", "add-path",
@@ -184,6 +186,9 @@ class MockHandler(BaseHTTPRequestHandler):
             {"path": self.path, "authorization": self.headers["Authorization"], "content_type": self.headers["Content-Type"], "body": body}
         )
         status, content_type, payload = self.server.next_reply(self.path, body.get("content"))
+        if status == DROP_CONNECTION:
+            self.close_connection = True
+            return
         encoded = payload.encode()
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -204,13 +209,16 @@ class PostHogWorkflowsScriptTest(unittest.TestCase):
         self.workspace = Path(tempfile.mkdtemp())
         (self.workspace / "workflows").mkdir()
         self.summary = self.workspace / "summary.md"
+        self.instant_sleep = Path(tempfile.mkdtemp())
+        (self.instant_sleep / "sleep").write_text("#!/bin/sh\n")
+        (self.instant_sleep / "sleep").chmod(0o755)
 
     def write(self, name: str, content: str) -> None:
         (self.workspace / "workflows" / name).write_text(content)
 
     def run_script(self, **env: str) -> subprocess.CompletedProcess:
         base_env = {
-            "PATH": os.environ["PATH"],
+            "PATH": f"{self.instant_sleep}{os.pathsep}{os.environ['PATH']}",
             "POSTHOG_API_KEY": "phs_example",
             "POSTHOG_PROJECT_ID": "42",
             "POSTHOG_HOST": f"http://127.0.0.1:{self.server.server_port}/",
@@ -328,6 +336,7 @@ class PostHogWorkflowsScriptTest(unittest.TestCase):
             ("server error without JSON", "check", 502, "<html><body>Bad gateway</body></html>", "PostHog answered HTTP 502 without JSON: <html><body>Bad gateway</body></html>"),
             ("check without a plan", "check", 200, "{}", "PostHog answered HTTP 200 without a result: {}"),
             ("apply without a result", "apply", 200, '{"workflow":null}', 'PostHog answered HTTP 200 without a result: {"workflow":null}'),
+            ("check with a plan that is not an object", "check", 200, '{"plan":"oops"}', 'PostHog answered HTTP 200 without a result: {"plan":"oops"}'),
         ]:
             with self.subTest(name):
                 self.server.reply_raw(CHECK_PATH if mode == "check" else APPLY_PATH, CLEAN_FILE, status, body)
@@ -336,18 +345,21 @@ class PostHogWorkflowsScriptTest(unittest.TestCase):
 
                 self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
                 self.assertIn(f"workflows/trial.yaml: {expected}", RunnerLog(run.stdout).visible)
+                self.assertEqual(RunnerLog(run.stdout).visible, [f"workflows/trial.yaml: {expected}", "1 of 1 workflow file(s) failed to check." if mode == "check" else "1 of 1 workflow file(s) failed to apply."])
                 self.assertEqual(RunnerLog(run.stdout).commands, [WorkflowCommand("error", {"file": "workflows/trial.yaml"}, expected)])
 
     def test_a_transient_failure_is_retried_once(self) -> None:
         self.write("trial.yaml", CLEAN_FILE)
         applied = {"result": "unchanged", "workflow": WORKFLOW, "plan": plan("unchanged"), "warnings": []}
         conflict = {"errors": [{"status": "conflict", "message": "Another request created this workflow.", "why": "w", "fix": "Apply the file again.", "path": None, "line": None, "column": None}]}
-        busy = {"detail": "Request was throttled."}
-        for name, replies, exit_code in [
-            ("server error, then success", [(503, {"detail": "Unavailable"}), (200, applied)], 0),
-            ("rate limit, then success", [(429, busy), (200, applied)], 0),
-            ("conflict, then success", [(409, conflict), (200, applied)], 0),
-            ("server error twice", [(502, {"detail": "Bad gateway"}), (502, {"detail": "Bad gateway"}), (200, applied)], 1),
+        dropped = (DROP_CONNECTION, None)
+        for name, replies, expected_requests, expected_error in [
+            ("server error, then success", [(503, {"detail": "Unavailable"}), (200, applied)], 2, None),
+            ("conflict, then success", [(409, conflict), (200, applied)], 2, None),
+            ("no answer, then success", [dropped, (200, applied)], 2, None),
+            ("server error twice", [(502, {"detail": "Bad gateway"}), (502, {"detail": "Bad gateway"}), (200, applied)], 2, "PostHog answered HTTP 502: Bad gateway"),
+            ("no answer twice", [dropped, dropped, (200, applied)], 2, f"Could not reach http://127.0.0.1:{self.server.server_port}{APPLY_PATH}: curl: (52)"),
+            ("rate limit", [(429, {"detail": "Request was throttled."}), (200, applied)], 1, "PostHog answered HTTP 429: Request was throttled."),
         ]:
             with self.subTest(name):
                 self.server.requests.clear()
@@ -355,8 +367,11 @@ class PostHogWorkflowsScriptTest(unittest.TestCase):
 
                 run = self.run_script(MODE="apply")
 
-                self.assertEqual(run.returncode, exit_code, run.stdout + run.stderr)
-                self.assertEqual(len(self.server.requests), 2)
+                self.assertEqual(len(self.server.requests), expected_requests)
+                self.assertEqual(run.returncode, 0 if expected_error is None else 1, run.stdout + run.stderr)
+                errors = [command.data for command in RunnerLog(run.stdout).commands]
+                self.assertEqual(len(errors), 0 if expected_error is None else 1, run.stdout)
+                self.assertTrue(all(error.startswith(expected_error) for error in errors), run.stdout)
 
     def test_a_host_without_https_is_refused(self) -> None:
         self.write("trial.yaml", CLEAN_FILE)

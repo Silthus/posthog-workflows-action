@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: posthog-workflows-${{ github.head_ref || github.ref }}
+  group: posthog-workflows-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -60,7 +60,7 @@ jobs:
 
 Change `main` if your default branch has another name.
 Pin the action to a full commit SHA, as above, because the `apply` job gives it a write key. `v0` is a tag that moves with each release.
-The `concurrency` group runs one job per branch at a time. A running apply is never canceled, and a queued one gives way to the newest push, which applies every file anyway.
+The `concurrency` group runs one run per pull request or branch at a time. A running apply is never canceled, and a queued one gives way to the newest push, which applies every file anyway.
 
 ## Setup
 
@@ -71,17 +71,19 @@ The `concurrency` group runs one job per branch at a time. A running apply is ne
 Both secrets have the same name and hold different keys. A job that declares `environment: posthog-workflows` reads the environment's value, and every other job reads the repository's value.
 So the `apply` job gets the write key, and the `check` job gets the read key.
 Create the environment before the first push to the default branch. If a workflow names an environment that does not exist, GitHub creates it without the branch limit.
+Environment secrets in a private repository need GitHub Pro, Team or Enterprise.
+If the environment has no `POSTHOG_API_KEY`, the `apply` job reads the repository's read key and every apply fails with HTTP 403.
 
 A project secret API key (`phs_`) works once [PostHog/posthog#104202](https://github.com/PostHog/posthog/pull/104202) is deployed. Until then PostHog answers it with HTTP 401.
 
 ## What it does
 
-- On a pull request each file is checked. Errors show as annotations on the file. The plan goes to the job summary: `create`, `update`, `stage` or `unchanged`, with the steps added, changed and removed.
+- On a pull request each file is checked. Errors show as annotations on the file. The plan goes to the job summary: `create`, `update` or `unchanged`, with the steps added, changed and removed.
 - On a push to the default branch each file is applied, and each prints `created`, `updated` or `unchanged`. Any error fails the job.
-- A request that gets no answer, HTTP 409 (a parallel apply of the same key), 429 or a 5xx is sent once more after two seconds.
+- A request that gets no answer, HTTP 408, 409 (the workflow was created or deleted during the apply) or a 5xx is sent once more after two seconds. HTTP 429 is not retried, because PostHog's rate limits last longer than that.
 - The host must use `https://`. Plain `http://` works only for `localhost` and `127.0.0.1`, so the key never travels unencrypted.
 - When no file matches `files`, the action prints one line and succeeds, so deleting the last workflow file keeps the job green.
-- When the key is empty, the action prints one line and succeeds. Pull requests from forks get no secrets, so they pass this way. In apply mode that line is a warning, because an empty key there usually means the environment secret is missing.
+- When the key is empty, the action prints one line and succeeds. Pull requests from forks get no secrets, so they pass this way. In apply mode that line is a warning, because it means no key is set for the `apply` job yet.
 - Text from PostHog and file names are printed with workflow commands stopped, so a message cannot run a workflow command.
 
 ## Inputs

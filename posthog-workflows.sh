@@ -158,18 +158,12 @@ matching_files() {
 }
 
 send_file() {
-  local file="$1" mode="$2" url="$3" http_status curl_exit attempt
+  local file="$1" mode="$2" url="$3" http_status
   if [[ -L "$file" || ! -f "$file" ]]; then
     report_failure "$file" "Not a regular file, so it was not sent."
     return 1
   fi
-  for attempt in 1 2; do
-    curl_exit=0
-    http_status="$(post_file "$file" "$url")" || curl_exit=$?
-    if ((attempt == 2)) || ! is_transient "$http_status"; then break; fi
-    sleep 2
-  done
-
+  http_status="$(post_with_one_retry "$file" "$url")"
   if [[ "$http_status" == "000" ]]; then
     report_failure "$file" "Could not reach ${url}: $(head -n 1 "$curl_errors")"
     return 1
@@ -178,27 +172,25 @@ send_file() {
     report_failure "$file" "PostHog answered HTTP ${http_status} without JSON: $(head -c 300 "$response" | tr -s '\r\n' ' ')"
     return 1
   fi
-  if ((curl_exit == 0)); then
-    if ! jq -e --arg mode "$mode" 'if $mode == "apply" then .result else .plan.result end | type == "string"' "$response" >/dev/null; then
-      report_failure "$file" "PostHog answered HTTP ${http_status} without a result: $(jq -r 'tojson | .[:300]' "$response")"
-      return 1
-    fi
-    jq -r --arg file "$file" --arg mode "$mode" "${JQ_HELPERS}${RESULT_LINES}" "$response" || return 1
-    jq -r --arg file "$file" "${JQ_HELPERS}${WARNING_ANNOTATIONS}" "$response" >>"$annotations" || return 1
-    jq -r --arg file "$file" "${JQ_HELPERS}${SUMMARY_RESULT}" "$response" >>"$summary" || return 1
-    return 0
-  fi
-  if jq -e '.errors | type == "array"' "$response" >/dev/null; then
-    jq -r --arg file "$file" "${JQ_HELPERS}${ERROR_LINES}" "$response"
-    jq -r --arg file "$file" "${JQ_HELPERS}${ERROR_ANNOTATIONS}" "$response" >>"$annotations"
-    jq -r --arg file "$file" "${JQ_HELPERS}${SUMMARY_ERRORS}" "$response" >>"$summary"
+  if [[ "$http_status" == 2?? ]]; then
+    report_result "$file" "$mode" "$http_status"
   else
-    report_failure "$file" "PostHog answered HTTP ${http_status}: $(jq -r '.detail // . | tostring | .[:1000]' "$response")"
+    report_errors "$file" "$http_status"
   fi
-  return 1
+}
+
+post_with_one_retry() {
+  local http_status
+  http_status="$(post_file "$1" "$2")" || true
+  if is_transient "$http_status"; then
+    sleep 2
+    http_status="$(post_file "$1" "$2")" || true
+  fi
+  echo "$http_status"
 }
 
 post_file() {
+  : >"$response"
   jq -Rs '{content: .}' <"$1" |
     curl --silent --show-error --fail-with-body --max-time 60 --connect-timeout 10 \
       --header @<(printf 'Authorization: Bearer %s\n' "$POSTHOG_API_KEY") \
@@ -207,7 +199,30 @@ post_file() {
 }
 
 is_transient() {
-  [[ "$1" =~ ^(000|408|409|429|5[0-9][0-9])$ ]]
+  [[ "$1" =~ ^(000|408|409|5[0-9][0-9])$ ]]
+}
+
+report_result() {
+  local file="$1" mode="$2" http_status="$3"
+  if ! jq -e --arg mode "$mode" 'if $mode == "apply" then .result else .plan.result? end | strings' "$response" >/dev/null 2>&1; then
+    report_failure "$file" "PostHog answered HTTP ${http_status} without a result: $(jq -r 'tojson | .[:300]' "$response")"
+    return 1
+  fi
+  jq -r --arg file "$file" --arg mode "$mode" "${JQ_HELPERS}${RESULT_LINES}" "$response" || return 1
+  jq -r --arg file "$file" "${JQ_HELPERS}${WARNING_ANNOTATIONS}" "$response" >>"$annotations" || return 1
+  jq -r --arg file "$file" "${JQ_HELPERS}${SUMMARY_RESULT}" "$response" >>"$summary" || return 1
+}
+
+report_errors() {
+  local file="$1" http_status="$2"
+  if jq -e '.errors | type == "array"' "$response" >/dev/null; then
+    jq -r --arg file "$file" "${JQ_HELPERS}${ERROR_LINES}" "$response"
+    jq -r --arg file "$file" "${JQ_HELPERS}${ERROR_ANNOTATIONS}" "$response" >>"$annotations"
+    jq -r --arg file "$file" "${JQ_HELPERS}${SUMMARY_ERRORS}" "$response" >>"$summary"
+  else
+    report_failure "$file" "PostHog answered HTTP ${http_status}: $(jq -r '.detail // . | tostring | .[:1000]' "$response")"
+  fi
+  return 1
 }
 
 report_failure() {
