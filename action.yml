@@ -5,13 +5,13 @@ branding:
   color: blue
 inputs:
   api-key:
-    description: A personal API key with hog_flow:read to check, or hog_flow:write to apply. A project secret API key (phs_) works once PostHog/posthog#104202 is deployed. When it is empty, the action prints one line and succeeds.
+    description: A personal API key with hog_flow:read to check, or hog_flow:write to apply. A project secret API key (phs_) works once PostHog/posthog#104202 is deployed. When it is empty, the action prints one line and succeeds, as a warning in apply mode.
     required: true
   project-id:
     description: The PostHog project id.
     required: true
   host:
-    description: The PostHog host.
+    description: The PostHog host. It must use https, except for localhost and 127.0.0.1.
     default: https://us.posthog.com
   files:
     description: One or more globs of workflow files, separated by spaces or line breaks.

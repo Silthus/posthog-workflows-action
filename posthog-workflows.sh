@@ -75,8 +75,11 @@ readonly SUMMARY_ERRORS='
 '
 
 main() {
+  local mode
+  mode="$(resolve_mode "${MODE:-auto}")"
+  [[ -n "$mode" ]] || fail "mode must be auto, check or apply. Got '${MODE}'."
   if [[ -z "${POSTHOG_API_KEY:-}" ]]; then
-    echo "::notice title=PostHog workflows::No PostHog API key is set, so no workflow file was checked or applied. Fork pull requests get no secrets, so this is expected there."
+    report_missing_key "$mode"
     exit 0
   fi
   if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
@@ -87,9 +90,8 @@ main() {
   local project_id="${POSTHOG_PROJECT_ID:-}"
   [[ "$project_id" =~ ^[0-9]+$ ]] || fail "project-id must be a PostHog project id, a number. Got '${project_id}'."
   local host="${POSTHOG_HOST:-https://us.posthog.com}"
-  local mode
-  mode="$(resolve_mode "${MODE:-auto}")"
-  [[ -n "$mode" ]] || fail "mode must be auto, check or apply. Got '${MODE}'."
+  [[ "$host" == https://* || "$host" =~ ^http://(localhost|127\.0\.0\.1)(:[0-9]+)?/?$ ]] ||
+    fail "host must start with https://, so the API key never travels unencrypted. Got '${host}'."
   local url="${host%/}/api/projects/${project_id}/hog_flows/code_${mode}/"
   summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
   response="$(mktemp)"
@@ -116,6 +118,14 @@ main() {
   if ((failures > 0)); then
     echo "${failures} of ${#files[@]} workflow file(s) failed to ${mode}."
     exit 1
+  fi
+}
+
+report_missing_key() {
+  if [[ "$1" == "apply" ]]; then
+    echo "::warning title=PostHog workflows::No PostHog API key is set, so no workflow file was applied. Check that this job can read the secret that holds the write key."
+  else
+    echo "::notice title=PostHog workflows::No PostHog API key is set, so no workflow file was checked. Fork pull requests get no secrets, so this is expected there."
   fi
 }
 
@@ -148,18 +158,17 @@ matching_files() {
 }
 
 send_file() {
-  local file="$1" mode="$2" url="$3" http_status curl_exit=0
+  local file="$1" mode="$2" url="$3" http_status curl_exit attempt
   if [[ -L "$file" || ! -f "$file" ]]; then
     report_failure "$file" "Not a regular file, so it was not sent."
     return 1
   fi
-  http_status="$(
-    jq -Rs '{content: .}' <"$file" |
-      curl --silent --show-error --fail-with-body --max-time 60 --connect-timeout 10 \
-        --header @<(printf 'Authorization: Bearer %s\n' "$POSTHOG_API_KEY") \
-        --header 'Content-Type: application/json' --header 'Accept: application/json' \
-        --data-binary @- --output "$response" --write-out '%{http_code}' "$url" 2>"$curl_errors"
-  )" || curl_exit=$?
+  for attempt in 1 2; do
+    curl_exit=0
+    http_status="$(post_file "$file" "$url")" || curl_exit=$?
+    if ((attempt == 2)) || ! is_transient "$http_status"; then break; fi
+    sleep 2
+  done
 
   if [[ "$http_status" == "000" ]]; then
     report_failure "$file" "Could not reach ${url}: $(head -n 1 "$curl_errors")"
@@ -170,6 +179,10 @@ send_file() {
     return 1
   fi
   if ((curl_exit == 0)); then
+    if ! jq -e --arg mode "$mode" 'if $mode == "apply" then .result else .plan.result end | type == "string"' "$response" >/dev/null; then
+      report_failure "$file" "PostHog answered HTTP ${http_status} without a result: $(jq -r 'tojson | .[:300]' "$response")"
+      return 1
+    fi
     jq -r --arg file "$file" --arg mode "$mode" "${JQ_HELPERS}${RESULT_LINES}" "$response" || return 1
     jq -r --arg file "$file" "${JQ_HELPERS}${WARNING_ANNOTATIONS}" "$response" >>"$annotations" || return 1
     jq -r --arg file "$file" "${JQ_HELPERS}${SUMMARY_RESULT}" "$response" >>"$summary" || return 1
@@ -183,6 +196,18 @@ send_file() {
     report_failure "$file" "PostHog answered HTTP ${http_status}: $(jq -r '.detail // . | tostring | .[:1000]' "$response")"
   fi
   return 1
+}
+
+post_file() {
+  jq -Rs '{content: .}' <"$1" |
+    curl --silent --show-error --fail-with-body --max-time 60 --connect-timeout 10 \
+      --header @<(printf 'Authorization: Bearer %s\n' "$POSTHOG_API_KEY") \
+      --header 'Content-Type: application/json' --header 'Accept: application/json' \
+      --data-binary @- --output "$response" --write-out '%{http_code}' "$2" 2>"$curl_errors"
+}
+
+is_transient() {
+  [[ "$1" =~ ^(000|408|409|429|5[0-9][0-9])$ ]]
 }
 
 report_failure() {

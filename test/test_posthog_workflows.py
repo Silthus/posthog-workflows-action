@@ -158,14 +158,21 @@ class RunnerLog:
 class MockPostHog(ThreadingHTTPServer):
     def __init__(self) -> None:
         super().__init__(("127.0.0.1", 0), MockHandler)
-        self.routes: dict[tuple[str, str], tuple[int, str, str]] = {}
+        self.routes: dict[tuple[str, str], list[tuple[int, str, str]]] = {}
         self.requests: list[dict] = []
 
     def reply(self, path: str, content: str, status: int, body: object) -> None:
-        self.routes[(path, content)] = (status, "application/json", json.dumps(body))
+        self.routes[(path, content)] = [(status, "application/json", json.dumps(body))]
 
     def reply_raw(self, path: str, content: str, status: int, body: str) -> None:
-        self.routes[(path, content)] = (status, "text/html", body)
+        self.routes[(path, content)] = [(status, "text/html", body)]
+
+    def reply_in_turn(self, path: str, content: str, replies: list[tuple[int, object]]) -> None:
+        self.routes[(path, content)] = [(status, "application/json", json.dumps(body)) for status, body in replies]
+
+    def next_reply(self, path: str, content: str) -> tuple[int, str, str]:
+        replies = self.routes.get((path, content), [(500, "text/plain", "no route")])
+        return replies.pop(0) if len(replies) > 1 else replies[0]
 
 
 class MockHandler(BaseHTTPRequestHandler):
@@ -176,7 +183,7 @@ class MockHandler(BaseHTTPRequestHandler):
         self.server.requests.append(
             {"path": self.path, "authorization": self.headers["Authorization"], "content_type": self.headers["Content-Type"], "body": body}
         )
-        status, content_type, payload = self.server.routes.get((self.path, body.get("content")), (500, "text/plain", "no route"))
+        status, content_type, payload = self.server.next_reply(self.path, body.get("content"))
         encoded = payload.encode()
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -298,24 +305,70 @@ class PostHogWorkflowsScriptTest(unittest.TestCase):
 
     def test_a_missing_key_prints_one_line_and_succeeds(self) -> None:
         self.write("trial.yaml", CLEAN_FILE)
+        push_to_main = {"MODE": "auto", "DEFAULT_BRANCH": "main", "GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main"}
 
-        run = self.run_script(POSTHOG_API_KEY="")
+        for name, env, expected_command in [
+            ("check", {"MODE": "check"}, "notice"),
+            ("apply", {"MODE": "apply"}, "warning"),
+            ("auto on a push to the default branch", push_to_main, "warning"),
+        ]:
+            with self.subTest(name):
+                run = self.run_script(POSTHOG_API_KEY="", **env)
 
-        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        self.assertEqual(len(run.stdout.splitlines()), 1, run.stdout)
-        self.assertIn("No PostHog API key", run.stdout)
-        self.assertEqual(run.stderr, "")
-        self.assertEqual(self.server.requests, [])
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                self.assertEqual(len(run.stdout.splitlines()), 1, run.stdout)
+                self.assertEqual([command.name for command in RunnerLog(run.stdout).commands], [expected_command], run.stdout)
+                self.assertIn("No PostHog API key", run.stdout)
+                self.assertEqual(run.stderr, "")
+                self.assertEqual(self.server.requests, [])
 
-    def test_a_non_json_server_error_prints_a_readable_message_and_fails(self) -> None:
+    def test_an_answer_the_script_cannot_read_prints_a_readable_message_and_fails(self) -> None:
         self.write("trial.yaml", CLEAN_FILE)
-        self.server.reply_raw(CHECK_PATH, CLEAN_FILE, 502, "<html><body>Bad gateway</body></html>")
+        for name, mode, status, body, expected in [
+            ("server error without JSON", "check", 502, "<html><body>Bad gateway</body></html>", "PostHog answered HTTP 502 without JSON: <html><body>Bad gateway</body></html>"),
+            ("check without a plan", "check", 200, "{}", "PostHog answered HTTP 200 without a result: {}"),
+            ("apply without a result", "apply", 200, '{"workflow":null}', 'PostHog answered HTTP 200 without a result: {"workflow":null}'),
+        ]:
+            with self.subTest(name):
+                self.server.reply_raw(CHECK_PATH if mode == "check" else APPLY_PATH, CLEAN_FILE, status, body)
 
-        run = self.run_script()
+                run = self.run_script(MODE=mode)
 
-        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
-        self.assertIn("workflows/trial.yaml: PostHog answered HTTP 502 without JSON: <html><body>Bad gateway</body></html>", run.stdout)
-        self.assertIn("::error file=workflows/trial.yaml::PostHog answered HTTP 502 without JSON", run.stdout)
+                self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+                self.assertIn(f"workflows/trial.yaml: {expected}", RunnerLog(run.stdout).visible)
+                self.assertEqual(RunnerLog(run.stdout).commands, [WorkflowCommand("error", {"file": "workflows/trial.yaml"}, expected)])
+
+    def test_a_transient_failure_is_retried_once(self) -> None:
+        self.write("trial.yaml", CLEAN_FILE)
+        applied = {"result": "unchanged", "workflow": WORKFLOW, "plan": plan("unchanged"), "warnings": []}
+        conflict = {"errors": [{"status": "conflict", "message": "Another request created this workflow.", "why": "w", "fix": "Apply the file again.", "path": None, "line": None, "column": None}]}
+        busy = {"detail": "Request was throttled."}
+        for name, replies, exit_code in [
+            ("server error, then success", [(503, {"detail": "Unavailable"}), (200, applied)], 0),
+            ("rate limit, then success", [(429, busy), (200, applied)], 0),
+            ("conflict, then success", [(409, conflict), (200, applied)], 0),
+            ("server error twice", [(502, {"detail": "Bad gateway"}), (502, {"detail": "Bad gateway"}), (200, applied)], 1),
+        ]:
+            with self.subTest(name):
+                self.server.requests.clear()
+                self.server.reply_in_turn(APPLY_PATH, CLEAN_FILE, replies)
+
+                run = self.run_script(MODE="apply")
+
+                self.assertEqual(run.returncode, exit_code, run.stdout + run.stderr)
+                self.assertEqual(len(self.server.requests), 2)
+
+    def test_a_host_without_https_is_refused(self) -> None:
+        self.write("trial.yaml", CLEAN_FILE)
+        for host in ["http://eu.posthog.example.com", "eu.posthog.example.com", "http://127.0.0.1.example.com", "HTTP://eu.posthog.example.com"]:
+            with self.subTest(host):
+                run = self.run_script(POSTHOG_HOST=host)
+
+                self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+                self.assertEqual(
+                    RunnerLog(run.stdout).commands,
+                    [WorkflowCommand("error", {"title": "PostHog workflows"}, f"host must start with https://, so the API key never travels unencrypted. Got '{host}'.")],
+                )
 
     def test_no_matching_file_prints_one_line_and_succeeds(self) -> None:
         run = self.run_script()
