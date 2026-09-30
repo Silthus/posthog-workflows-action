@@ -1,0 +1,33 @@
+name: PostHog workflows
+description: Check PostHog workflow YAML files on pull requests and apply them on the default branch.
+branding:
+  icon: git-pull-request
+  color: blue
+inputs:
+  api-key:
+    description: A project secret API key, or a personal API key with hog_flow:read and hog_flow:write. When it is empty, the action prints one line and succeeds.
+    required: true
+  project-id:
+    description: The PostHog project id.
+    required: true
+  host:
+    description: The PostHog host.
+    default: https://us.posthog.com
+  files:
+    description: One or more space-separated globs of workflow files.
+    default: workflows/*.yaml
+  mode:
+    description: auto checks on pull requests and applies on a push to the default branch. check or apply force one.
+    default: auto
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        POSTHOG_API_KEY: ${{ inputs.api-key }}
+        POSTHOG_PROJECT_ID: ${{ inputs.project-id }}
+        POSTHOG_HOST: ${{ inputs.host }}
+        WORKFLOW_FILES: ${{ inputs.files }}
+        MODE: ${{ inputs.mode }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: bash "$GITHUB_ACTION_PATH/posthog-workflows.sh"
