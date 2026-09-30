@@ -48,7 +48,7 @@ def removed_detail:
   (if $plan.workflow then "**\($plan.workflow.name | cell)** (`\($plan.workflow.key)`), status \($plan.status.from // "none") → \($plan.status.to)."
    else "A new workflow, status \($plan.status.to)." end)
   + (if ($plan.changed_fields // []) == [] then "" else " Changed fields: \($plan.changed_fields | join(", "))." end)
-  + (if $plan.in_flight_runs then " People in it now: \($plan.in_flight_runs)." else "" end)
+  + (if $plan.workflow and $plan.in_flight_runs != null then " People in it now: \($plan.in_flight_runs)." else "" end)
   + (if $plan.discards_draft then " Applying it discards a staged draft." else "" end),
   "",
   ( [ ($plan.added_steps // [])[] | "| Added | \(.name | cell) | \(.type) | |" ]
@@ -83,7 +83,8 @@ main() {
   local url="${host%/}/api/projects/${project_id}/hog_flows/code_${mode}/"
   summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
   response="$(mktemp)"
-  trap 'rm -f "$response"' EXIT
+  curl_errors="$(mktemp)"
+  trap 'rm -f "$response" "$curl_errors"' EXIT
 
   local files
   mapfile -t files < <(matching_files "${WORKFLOW_FILES:-workflows/*.yaml}")
@@ -133,11 +134,11 @@ send_file() {
       curl --silent --show-error --fail-with-body --max-time 60 --connect-timeout 10 \
         --header @<(printf 'Authorization: Bearer %s\n' "$POSTHOG_API_KEY") \
         --header 'Content-Type: application/json' --header 'Accept: application/json' \
-        --data-binary @- --output "$response" --write-out '%{http_code}' "$url"
+        --data-binary @- --output "$response" --write-out '%{http_code}' "$url" 2>"$curl_errors"
   )" || curl_exit=$?
 
   if [[ "$http_status" == "000" ]]; then
-    report_failure "$file" "Could not reach ${url} (curl exit code ${curl_exit})."
+    report_failure "$file" "Could not reach ${url}: $(head -n 1 "$curl_errors")"
     return 1
   fi
   if ! jq -e 'type == "object"' "$response" >/dev/null 2>&1; then

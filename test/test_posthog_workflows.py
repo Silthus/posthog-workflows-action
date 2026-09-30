@@ -184,6 +184,7 @@ class PostHogWorkflowsScriptTest(unittest.TestCase):
         self.assertIn("workflows/broken.yaml: missing_field: The file has no name.", run.stdout)
         self.assertIn("::error file=workflows/broken.yaml,title=missing_field::The file has no name.", run.stdout)
         self.assertIn("workflows/trial.yaml: unchanged trial-upgrade-nudge", run.stdout)
+        self.assertEqual(run.stderr, "")
 
     def test_apply_reports_created_updated_and_unchanged(self) -> None:
         self.write("new.yaml", NEW_FILE)
