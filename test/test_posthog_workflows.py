@@ -1,9 +1,11 @@
 import json
 import os
+import re
 import subprocess
 import tempfile
 import threading
 import unittest
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -80,6 +82,77 @@ BROKEN_ERRORS = {
         },
     ]
 }
+
+INJECTION = "\n::set-output name=x::y\n::add-mask::\r::warning::from the api\n##[set-output name=v1;]z ::error::inline"
+INJECTED_FILE_NAME = f"evil{INJECTION}.yaml"
+LONG_DETAIL = f"Too long{INJECTION}" + "x" * 200_000
+MANY_PERCENT_SIGNS = "%" * 200_000
+
+RUNNER_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+RUNNER_COMMANDS = {
+    "stop-commands", "internal-set-repo-path", "set-env", "set-output", "save-state", "add-mask", "add-path",
+    "add-matcher", "remove-matcher", "debug", "warning", "error", "notice", "group", "endgroup", "echo",
+}
+DATA_ESCAPES = [("\r", "%0D"), ("\n", "%0A"), ("%", "%25")]
+PROPERTY_ESCAPES = [("\r", "%0D"), ("\n", "%0A"), (":", "%3A"), (",", "%2C"), ("%", "%25")]
+
+
+@dataclass(frozen=True)
+class WorkflowCommand:
+    name: str
+    properties: dict[str, str]
+    data: str
+
+
+def unescape(value: str, escapes: list[tuple[str, str]]) -> str:
+    for token, replacement in escapes:
+        value = value.replace(replacement, token)
+    return value
+
+
+def parse_properties(text: str, separator: str) -> dict[str, str]:
+    pairs = [pair.split("=", 1) for pair in text.split(separator) if "=" in pair]
+    return {key: unescape(value, PROPERTY_ESCAPES) for key, value in pairs}
+
+
+def parse_command(line: str, registered: set[str]) -> WorkflowCommand | None:
+    stripped = line.lstrip()
+    end = stripped.find("::", 2)
+    if stripped.startswith("::") and end >= 0:
+        name, _, properties = stripped[2:end].partition(" ")
+        if name.lower() in registered:
+            return WorkflowCommand(name, parse_properties(properties.strip(), ","), unescape(stripped[end + 2 :], DATA_ESCAPES))
+    start = line.find("##[")
+    end = line.find("]", start)
+    if start >= 0 and end >= 0:
+        name, _, properties = line[start + 3 : end].partition(" ")
+        if name.lower() in registered:
+            return WorkflowCommand(name, parse_properties(properties, ";"), line[end + 1 :])
+    return None
+
+
+class RunnerLog:
+    """Reads a step's output the way the GitHub runner does: both command syntaxes, and stop-commands."""
+
+    def __init__(self, output: str) -> None:
+        self.commands: list[WorkflowCommand] = []
+        self.visible: list[str] = []
+        stop_token: str | None = None
+        for line in RUNNER_LINE_BREAK.split(output.removesuffix("\n")) if output else []:
+            registered = RUNNER_COMMANDS if stop_token is None else RUNNER_COMMANDS | {stop_token.lower()}
+            command = parse_command(line, registered)
+            if stop_token is not None:
+                if command and command.name.lower() == stop_token.lower():
+                    stop_token = None
+                else:
+                    self.visible.append(line)
+            elif command is None:
+                self.visible.append(line)
+            elif command.name.lower() == "stop-commands":
+                stop_token = command.data
+            else:
+                self.commands.append(command)
+        self.stopped = stop_token is not None
 
 
 class MockPostHog(ThreadingHTTPServer):
@@ -167,9 +240,10 @@ class PostHogWorkflowsScriptTest(unittest.TestCase):
         self.server.reply(CHECK_PATH, BROKEN_FILE, 400, BROKEN_ERRORS)
         self.server.reply(CHECK_PATH, CLEAN_FILE, 200, {"plan": plan("unchanged"), "warnings": []})
 
-        run = self.run_script()
+        run = self.run_script(WORKFLOW_FILES="workflows/broken.yaml\nworkflows/trial.yaml workflows/deleted.yaml")
 
         self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertEqual(len(self.server.requests), 2)
         self.assertIn(
             "workflows/broken.yaml:5:15: invalid_value: steps[0].duration: '3 days' is not a duration.\n"
             "  why: A delay needs a number followed by one unit: s, m, h or d.\n"
@@ -242,6 +316,109 @@ class PostHogWorkflowsScriptTest(unittest.TestCase):
         self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
         self.assertIn("workflows/trial.yaml: PostHog answered HTTP 502 without JSON: <html><body>Bad gateway</body></html>", run.stdout)
         self.assertIn("::error file=workflows/trial.yaml::PostHog answered HTTP 502 without JSON", run.stdout)
+
+    def test_no_matching_file_prints_one_line_and_succeeds(self) -> None:
+        run = self.run_script()
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        log = RunnerLog(run.stdout)
+        self.assertEqual(log.visible, ["No workflow files match workflows/*.yaml; nothing to check."])
+        self.assertEqual(log.commands, [])
+        self.assertEqual(self.server.requests, [])
+
+    def test_a_symbolic_link_is_not_sent(self) -> None:
+        (self.workspace / "outside.txt").write_text("token: invented-secret\n")
+        (self.workspace / "workflows" / "link.yaml").symlink_to(self.workspace / "outside.txt")
+
+        run = self.run_script()
+
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(
+            RunnerLog(run.stdout).commands, [WorkflowCommand("error", {"file": "workflows/link.yaml"}, "Not a regular file, so it was not sent.")]
+        )
+
+    def test_inputs_never_run_a_workflow_command(self) -> None:
+        for name, env, expected_commands in [
+            ("files", {"WORKFLOW_FILES": f"none/*.yaml{INJECTION}"}, []),
+            ("project id", {"POSTHOG_PROJECT_ID": f"1{INJECTION}"}, [WorkflowCommand("error", {"title": "PostHog workflows"}, f"project-id must be a PostHog project id, a number. Got '1{INJECTION}'.")]),
+            (
+                "api key",
+                {"POSTHOG_API_KEY": f"phs_x{INJECTION}", "GITHUB_ACTIONS": "true"},
+                [
+                    WorkflowCommand("add-mask", {}, f"phs_x{INJECTION}"),
+                    WorkflowCommand("error", {"title": "PostHog workflows"}, "api-key must be one API key, without spaces or line breaks."),
+                ],
+            ),
+        ]:
+            with self.subTest(name):
+                run = self.run_script(**env)
+
+                log = RunnerLog(run.stdout)
+                self.assertEqual(log.commands, expected_commands, run.stdout)
+                self.assertFalse(log.stopped, run.stdout)
+                self.assertEqual(self.server.requests, [])
+
+    def test_text_from_the_api_or_the_file_never_runs_a_workflow_command(self) -> None:
+        self.write(INJECTED_FILE_NAME, CLEAN_FILE)
+        file = f"workflows/{INJECTED_FILE_NAME}"
+        evil_workflow = {**WORKFLOW, "key": INJECTION, "name": INJECTION, "version": INJECTION, "status": INJECTION}
+        evil_plan = plan(
+            INJECTION,
+            workflow=evil_workflow,
+            changed_fields=[INJECTION],
+            added_steps=[{"id": "a", "name": INJECTION, "type": INJECTION}],
+            changed_steps=[{"id": "b", "name": INJECTION, "type": INJECTION, "changes": [INJECTION]}],
+            removed_steps=[{"action_id": "c", "name": INJECTION, "runs": 2, "moves_to": {"action_id": "d", "name": INJECTION}, "exits": False}],
+        )
+        evil_warning = {"message": f"Careful{INJECTION}", "fix": INJECTION, "path": INJECTION}
+        warning = WorkflowCommand("warning", {"file": file}, f"Careful{INJECTION}\nFix: {INJECTION}")
+        cases = [
+            (
+                "located errors",
+                "check",
+                400,
+                {
+                    "errors": [
+                        {"status": f"bad{INJECTION}", "message": f"Bad{INJECTION}", "why": INJECTION, "fix": INJECTION, "path": INJECTION, "line": f"5,title=x::{INJECTION}", "column": INJECTION},
+                        {"status": "invalid_value", "message": INJECTION, "why": MANY_PERCENT_SIGNS, "fix": "f", "path": None, "line": 5.0, "column": 15.0},
+                    ]
+                },
+                1,
+                [
+                    WorkflowCommand("error", {"file": file, "title": f"bad{INJECTION}"}, f"Bad{INJECTION}\nWhy: {INJECTION}\nFix: {INJECTION}"),
+                    WorkflowCommand("error", {"file": file, "line": "5", "col": "15", "title": "invalid_value"}, f"{INJECTION}\nWhy: {MANY_PERCENT_SIGNS}\nFix: f"),
+                ],
+            ),
+            ("check plan", "check", 200, {"plan": evil_plan, "warnings": [evil_warning]}, 0, [warning]),
+            ("apply result", "apply", 200, {"result": INJECTION, "workflow": evil_workflow, "plan": evil_plan, "warnings": [evil_warning]}, 0, [warning]),
+            ("http error detail", "check", 401, {"detail": INJECTION}, 1, [WorkflowCommand("error", {"file": file}, f"PostHog answered HTTP 401: {INJECTION}")]),
+            ("long http error detail", "check", 401, {"detail": LONG_DETAIL}, 1, [WorkflowCommand("error", {"file": file}, f"PostHog answered HTTP 401: {LONG_DETAIL[:1000]}")]),
+            ("plan jq cannot read", "check", 200, {"plan": {**evil_plan, "changed_steps": [{"name": "x", "type": "delay", "changes": INJECTION}]}, "warnings": []}, 1, []),
+        ]
+        for name, mode, status, body, exit_code, expected_commands in cases:
+            with self.subTest(name):
+                self.server.routes.clear()
+                self.server.reply(CHECK_PATH if mode == "check" else APPLY_PATH, CLEAN_FILE, status, body)
+
+                run = self.run_script(MODE=mode)
+
+                self.assertEqual(run.returncode, exit_code, run.stdout + run.stderr)
+                log = RunnerLog(run.stdout)
+                self.assertEqual(log.commands, expected_commands, run.stdout)
+                self.assertFalse(log.stopped, run.stdout)
+                self.assertIn("::set-output name=x::y", log.visible)
+                self.assertEqual(RunnerLog(run.stderr).commands, [], run.stderr)
+
+        with self.subTest("body without JSON"):
+            self.server.reply_raw(CHECK_PATH, CLEAN_FILE, 502, f"<html>{INJECTION}</html>")
+
+            run = self.run_script()
+
+            log = RunnerLog(run.stdout)
+            self.assertEqual([(command.name, command.properties) for command in log.commands], [("error", {"file": file})], run.stdout)
+            self.assertTrue(log.commands[0].data.startswith("PostHog answered HTTP 502 without JSON: <html>"), run.stdout)
+            self.assertFalse(log.stopped, run.stdout)
 
 
 if __name__ == "__main__":

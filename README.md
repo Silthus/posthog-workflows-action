@@ -31,24 +31,28 @@ jobs:
 
 On a pull request each file is checked: errors show as annotations on the file, and the plan (created, updated or unchanged, with the steps added, changed and removed) goes to the job summary.
 On a push to the default branch each file is applied. Any error fails the job.
+When no file matches `files`, the action prints one line and succeeds, so deleting the last workflow file keeps the job green.
+Text from PostHog and file names are printed with workflow commands stopped, so a message cannot run a workflow command.
 
 ## Inputs
 
 | Input        | Required | Default                  | Meaning                                                                                  |
 | ------------ | -------- | ------------------------ | ---------------------------------------------------------------------------------------- |
-| `api-key`    | yes      |                          | A project secret API key, or a personal API key with `hog_flow:read` and `hog_flow:write` |
+| `api-key`    | yes      |                          | A personal API key with `hog_flow:read` to check, or `hog_flow:write` to apply            |
 | `project-id` | yes      |                          | The PostHog project id                                                                   |
 | `host`       | no       | `https://us.posthog.com` | The PostHog host, for example `https://eu.posthog.com`                                   |
-| `files`      | no       | `workflows/*.yaml`       | One or more space-separated globs                                                        |
+| `files`      | no       | `workflows/*.yaml`       | One or more globs, separated by spaces or line breaks                                    |
 | `mode`       | no       | `auto`                   | `auto` checks pull requests and applies pushes to the default branch; `check` or `apply` |
 
 ## Setup
 
-1. In PostHog, create a project secret API key with the `hog_flow:read` and `hog_flow:write` scopes.
+1. In PostHog, create a personal API key limited to the project. Give it `hog_flow:read` if the action only checks, or `hog_flow:write` if it also applies.
 2. In the repository, add it as the secret `POSTHOG_API_KEY` (Settings, Secrets and variables, Actions, Secrets).
 3. Add the project id as the variable `POSTHOG_PROJECT_ID` (same page, Variables).
 
-To keep the write key away from pull request runs, put it in a GitHub environment that only the default branch may use.
+To keep the write key away from pull request runs, store a `hog_flow:read` key as the repository secret, and the `hog_flow:write` key under the same name in a GitHub environment that only the default branch may use.
+
+A project secret API key (`phs_`) works once [PostHog/posthog#104202](https://github.com/PostHog/posthog/pull/104202) is deployed. Until then PostHog answers it with HTTP 401.
 
 When the key is empty the action prints one line and succeeds. Pull requests from forks get no secrets, so they pass this way.
 
